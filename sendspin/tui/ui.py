@@ -19,6 +19,10 @@ from rich.table import Table
 from rich.text import Text
 
 from sendspin.discovery import DiscoveredServer
+from sendspin.tui.visualizer import (
+    VisualizerState,
+    render_spectrum,
+)
 from sendspin.utils import create_task
 
 
@@ -38,6 +42,7 @@ SHORTCUT_HIGHLIGHT_DURATION = 0.15
 REFRESH_COALESCE_DELAY = 1 / 30
 PLAYBACK_REFRESH_INTERVAL = 0.25
 HIGHLIGHT_REFRESH_INTERVAL = 0.05
+VISUALIZER_REFRESH_INTERVAL = 1 / 60
 RESIZE_POLL_INTERVAL = 0.25
 
 
@@ -85,6 +90,10 @@ class UIState:
     repeat_mode: RepeatMode | None = None
     shuffle: bool | None = None
 
+    # Visualizer
+    visualizer_enabled: bool = False
+    visualizer_state: VisualizerState = field(default_factory=VisualizerState)
+
     # Shortcut highlight
     highlighted_shortcut: str | None = None
     highlight_time: float = 0.0
@@ -100,6 +109,7 @@ class SendspinUI:
         player_volume: int = 100,
         player_muted: bool = False,
         use_external_volume: bool = False,
+        visualizer_enabled: bool = False,
     ) -> None:
         """Initialize the UI."""
         self._console = Console()
@@ -109,6 +119,7 @@ class SendspinUI:
             player_volume=player_volume,
             player_muted=player_muted,
             use_external_volume=use_external_volume,
+            visualizer_enabled=visualizer_enabled,
         )
         self._live: Live | None = None
         self._running = False
@@ -155,6 +166,10 @@ class SendspinUI:
             and (self._state.track_duration_ms or 0) > 0
         )
 
+    def _needs_visualizer_refresh(self) -> bool:
+        """Check if the visualizer needs periodic refreshes for interpolation."""
+        return self._state.visualizer_enabled and self._state.visualizer_state.is_active
+
     def _next_refresh_interval(self) -> float | None:
         """Return the next periodic refresh interval, if any."""
         intervals: list[float] = []
@@ -162,6 +177,8 @@ class SendspinUI:
             intervals.append(PLAYBACK_REFRESH_INTERVAL)
         if self._has_active_highlight():
             intervals.append(HIGHLIGHT_REFRESH_INTERVAL)
+        if self._needs_visualizer_refresh():
+            intervals.append(VISUALIZER_REFRESH_INTERVAL)
         return min(intervals) if intervals else None
 
     def _flush_refresh(self, *, force: bool = False) -> None:
@@ -576,6 +593,24 @@ class SendspinUI:
 
         return Panel(content, title="Server", border_style="yellow", expand=expand)
 
+    def _build_visualizer_rows(self, height: int) -> list[Text]:
+        """Build the spectrum visualizer as raw Text rows."""
+        state = self._state.visualizer_state
+        state.step()
+        magnitudes = state.get_spectrum()
+        loudness = state.loudness
+        peaks = state.get_peaks()
+
+        bar_width = max(10, self._console.width - 1)
+        return render_spectrum(magnitudes, bar_width, height, loudness, peaks)
+
+    def _measure_layout_height(self, layout: Table) -> int:
+        """Measure the rendered height of a layout table."""
+        lines = 0
+        for segment in self._console.render(layout):
+            lines += str(segment.text).count("\n")
+        return lines
+
     def _build_layout(self) -> Table:
         """Build the complete UI layout."""
         # Get terminal width and leave 1 char margin to prevent wrapping
@@ -716,11 +751,21 @@ class SendspinUI:
             bottom_row.add_row(playback, stream, server)
             layout.add_row(bottom_row)
 
-        # Quit shortcut below boxes
+        # Bottom shortcuts below boxes
         quit_line = Text(justify="right")
+        quit_line.append("v", style=self._shortcut_style("visualizer"))
+        quit_line.append(" visualizer  ", style="dim")
         quit_line.append("q", style=self._shortcut_style("quit"))
         quit_line.append(" quit  ", style="dim")
         layout.add_row(quit_line)
+
+        # Visualizer: fill remaining terminal space
+        if self._state.visualizer_enabled:
+            panel_height = self._measure_layout_height(layout)
+            remaining = self._console.height - panel_height
+            if remaining >= 3:
+                for row in self._build_visualizer_rows(remaining):
+                    layout.add_row(row)
 
         return layout
 
@@ -845,6 +890,19 @@ class SendspinUI:
         """Update repeat mode and shuffle state."""
         self._state.repeat_mode = repeat_mode
         self._state.shuffle = shuffle
+        self.refresh()
+
+    def set_visualizer_frame(self, spectrum: list[int] | None, loudness: int | None) -> None:
+        """Update visualizer state with new frame data."""
+        if self._state.visualizer_enabled:
+            self._state.visualizer_state.update(spectrum, loudness)
+            self.refresh()
+
+    def set_visualizer_enabled(self, enabled: bool) -> None:
+        """Update whether the visualizer is enabled."""
+        self._state.visualizer_enabled = enabled
+        if not enabled:
+            self._state.visualizer_state.clear()
         self.refresh()
 
     def show_server_selector(self, servers: list[DiscoveredServer]) -> None:

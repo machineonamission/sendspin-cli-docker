@@ -7,6 +7,7 @@ import contextlib
 import logging
 import signal
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -27,6 +28,11 @@ from aiosendspin.models.player import (
     PlayerCommandPayload,
     SupportedAudioFormat,
 )
+from aiosendspin.models.visualizer import (
+    ClientHelloVisualizerSpectrum,
+    ClientHelloVisualizerSupport,
+    VisualizerFrame,
+)
 from aiosendspin.models.types import (
     MediaCommand,
     PlaybackStateType,
@@ -44,6 +50,7 @@ from sendspin.settings import ClientSettings
 from sendspin.tui.keyboard import keyboard_loop
 from sendspin.tui.ui import SendspinUI
 from sendspin.utils import create_task, get_device_info
+from sendspin.visualizer_connector import VisualizerHandler
 
 logger = logging.getLogger(__name__)
 
@@ -240,11 +247,102 @@ class SendspinApp:
 
         self._client: SendspinClient | None = None
         self._audio_handler: AudioStreamHandler | None = None
+        self._visualizer_handler: VisualizerHandler | None = None
         self._settings = args.settings
+        self._visualizer_enabled: bool = args.settings.visualizer
         self._discovery = ServiceDiscovery()
         self._connection_manager = ConnectionManager(self._discovery)
         self._connect_task: asyncio.Task[None] | None = None
         self._mpris: SendspinMpris | None = None
+        self._listener_unsubscribes: list[Callable[[], None]] = []
+
+    @staticmethod
+    def _build_visualizer_support() -> ClientHelloVisualizerSupport:
+        """Build visualizer support payload for client/hello."""
+        return ClientHelloVisualizerSupport(
+            buffer_capacity=65536,
+            types=["loudness", "spectrum"],
+            batch_max=8,
+            spectrum=ClientHelloVisualizerSpectrum(
+                n_disp_bins=48,
+                scale="mel",
+                f_min=20,
+                f_max=20000,
+                rate_max=30,
+            ),
+        )
+
+    def _create_client(self) -> SendspinClient:
+        """Create a new SendspinClient with roles based on current visualizer state."""
+        args = self._args
+        roles = [Roles.CONTROLLER, Roles.PLAYER, Roles.METADATA]
+        visualizer_support = None
+        if self._visualizer_enabled:
+            visualizer_support = self._build_visualizer_support()
+            roles.append(Roles.VISUALIZER)
+
+        assert self._audio_handler is not None
+        delay = (
+            args.static_delay_ms
+            if args.static_delay_ms is not None
+            else self._settings.static_delay_ms
+        )
+
+        return SendspinClient(
+            client_id=args.client_id,
+            client_name=args.client_name,
+            roles=roles,
+            device_info=get_device_info(),
+            player_support=ClientHelloPlayerSupport(
+                supported_formats=self._supported_formats,
+                buffer_capacity=32_000_000,
+                supported_commands=[PlayerCommand.VOLUME, PlayerCommand.MUTE],
+            ),
+            visualizer_support=visualizer_support,
+            static_delay_ms=delay,
+            initial_volume=self._audio_handler.volume,
+            initial_muted=self._audio_handler.muted,
+        )
+
+    def _attach_client(self) -> None:
+        """Attach listeners, audio handler, visualizer, and MPRIS to the current client."""
+        assert self._client is not None
+        assert self._audio_handler is not None
+
+        self._listener_unsubscribes = [
+            self._client.add_metadata_listener(self._handle_metadata_update),
+            self._client.add_group_update_listener(self._handle_group_update),
+            self._client.add_controller_state_listener(self._handle_server_state),
+            self._client.add_server_command_listener(self._handle_server_command),
+        ]
+        self._audio_handler.attach_client(self._client)
+
+        if self._visualizer_enabled:
+            self._visualizer_handler = VisualizerHandler(
+                on_frame=self._handle_visualizer_frame,
+            )
+            self._visualizer_handler.attach_client(self._client)
+
+        if MPRIS_AVAILABLE and self._args.use_mpris:
+            self._mpris = SendspinMpris(self._client)
+            self._mpris.start()
+
+    def _detach_client(self) -> None:
+        """Detach listeners, audio handler, visualizer, and MPRIS from the current client."""
+        assert self._audio_handler is not None
+
+        for unsub in self._listener_unsubscribes:
+            unsub()
+        self._listener_unsubscribes = []
+        self._audio_handler.detach_client()
+
+        if self._visualizer_handler:
+            self._visualizer_handler.detach()
+            self._visualizer_handler = None
+
+        if self._mpris:
+            self._mpris.stop()
+            self._mpris = None
 
     async def run(self) -> int:  # noqa: PLR0915
         """Run the application."""
@@ -292,24 +390,9 @@ class SendspinApp:
             if args.preferred_format is not None:
                 supported_formats = [f for f in supported_formats if f != args.preferred_format]
                 supported_formats.insert(0, args.preferred_format)
+            self._supported_formats = supported_formats
 
-            self._client = SendspinClient(
-                client_id=args.client_id,
-                client_name=args.client_name,
-                roles=[Roles.CONTROLLER, Roles.PLAYER, Roles.METADATA],
-                device_info=get_device_info(),
-                player_support=ClientHelloPlayerSupport(
-                    supported_formats=supported_formats,
-                    buffer_capacity=32_000_000,
-                    supported_commands=[PlayerCommand.VOLUME, PlayerCommand.MUTE],
-                ),
-                static_delay_ms=delay,
-                initial_volume=self._audio_handler.volume,
-                initial_muted=self._audio_handler.muted,
-            )
-
-            if MPRIS_AVAILABLE and args.use_mpris:
-                self._mpris = SendspinMpris(self._client)
+            self._client = self._create_client()
 
             await self._audio_handler.start_volume_monitor()
 
@@ -318,6 +401,7 @@ class SendspinApp:
                 player_volume=self._audio_handler.volume,
                 player_muted=self._audio_handler.muted,
                 use_external_volume=self._audio_handler.uses_external_volume_controller,
+                visualizer_enabled=self._visualizer_enabled,
             )
             self._ui.start()
             self._ui.add_event(f"Using client ID: {args.client_id}")
@@ -325,19 +409,12 @@ class SendspinApp:
 
             await self._discovery.start()
 
-            self._client.add_metadata_listener(self._handle_metadata_update)
-            self._client.add_group_update_listener(self._handle_group_update)
-            self._client.add_controller_state_listener(self._handle_server_state)
-            self._client.add_server_command_listener(self._handle_server_command)
-            self._audio_handler.attach_client(self._client)
-
-            if self._mpris:
-                self._mpris.start()
+            self._attach_client()
 
             # Start keyboard loop for interactive control
             create_task(
                 keyboard_loop(
-                    self._client,
+                    lambda: self._client,
                     self._state,
                     self._audio_handler,
                     self._ui,
@@ -345,6 +422,7 @@ class SendspinApp:
                     self._show_server_selector,
                     self._on_server_selected,
                     request_shutdown,
+                    on_toggle_visualizer=self._toggle_visualizer,
                 )
             )
 
@@ -396,12 +474,14 @@ class SendspinApp:
         finally:
             if self._mpris:
                 self._mpris.stop()
+            if self._visualizer_handler:
+                self._visualizer_handler.detach()
             if self._ui:
                 self._ui.stop()
             if self._audio_handler:
                 await self._audio_handler.shutdown()
-            assert self._client is not None
-            await self._client.disconnect()
+            if self._client is not None:
+                await self._client.disconnect()
             await self._discovery.stop()
             await self._settings.flush()
 
@@ -426,6 +506,8 @@ class SendspinApp:
         logger.info(message)
         self._ui.add_event(message)
         self._ui.set_disconnected(message)
+        if self._visualizer_handler:
+            self._visualizer_handler.reset()
         await self._audio_handler.handle_disconnect()
 
     async def _connect_cancellable(self, url: str) -> None:
@@ -485,7 +567,6 @@ class SendspinApp:
         assert self._ui is not None
         manager = self._connection_manager
         ui = self._ui
-        client = self._client
         discovery = self._discovery
         url = self._state.selected_server.url
         manager.set_last_attempted_url(url)
@@ -510,7 +591,8 @@ class SendspinApp:
 
                 # Wait for disconnect
                 disconnect_event: asyncio.Event = asyncio.Event()
-                unsubscribe = client.add_disconnect_listener(disconnect_event.set)
+                assert self._client is not None
+                unsubscribe = self._client.add_disconnect_listener(disconnect_event.set)
                 await disconnect_event.wait()
                 unsubscribe()
 
@@ -689,6 +771,34 @@ class SendspinApp:
         """Handle audio format changes by updating the UI."""
         assert self._ui is not None
         self._ui.set_audio_format(codec, sample_rate, bit_depth, channels)
+
+    async def _toggle_visualizer(self) -> None:
+        """Toggle the visualizer on/off, reconnecting with updated roles."""
+        assert self._ui is not None
+
+        self._visualizer_enabled = not self._visualizer_enabled
+        self._settings.update(visualizer=self._visualizer_enabled)
+        self._ui.set_visualizer_enabled(self._visualizer_enabled)
+
+        old_client = self._client
+        self._detach_client()  # detach from old (still self._client)
+
+        self._client = self._create_client()
+        self._attach_client()  # attach to new self._client
+
+        if old_client is not None:
+            # Reuse server-switch mechanism so the connection loop treats the
+            # client swap as a reconnect (prevents CancelledError propagation
+            # when a connect is in-flight).
+            if self._state.selected_server:
+                self._connection_manager.set_pending_server(self._state.selected_server)
+            if not self._cancel_connect():
+                await old_client.disconnect()
+
+    def _handle_visualizer_frame(self, frame: VisualizerFrame) -> None:
+        """Handle a visualizer frame from the connector."""
+        if self._ui is not None:
+            self._ui.set_visualizer_frame(frame.spectrum, frame.loudness)
 
     def _on_stream_event(self, event: str) -> None:
         """Handle stream lifecycle events by running hooks."""

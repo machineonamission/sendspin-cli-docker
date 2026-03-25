@@ -328,6 +328,12 @@ Hooks receive these environment variables:
 - `SENDSPIN_CLIENT_ID` - Client identifier
 - `SENDSPIN_CLIENT_NAME` - Client friendly name
 
+### Visualizer
+
+The TUI includes a real-time audio spectrum visualizer that displays frequency data received from the server. This uses the experimental `visualizer@_draft_r1` role. The spectrum data is computed on the server and sent via sendspin to the TUI.
+
+Toggle it by pressing `v` in the TUI. Your preference is saved in settings and remembered on next launch.
+
 ### Debugging & Troubleshooting
 
 If you experience synchronization issues or audio glitches, you can enable detailed logging to help diagnose the problem:
