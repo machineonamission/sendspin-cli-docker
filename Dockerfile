@@ -27,6 +27,4 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 ENV PATH="/app/.venv/bin:$PATH"
 
 # Reset the entrypoint, don't invoke `uv`
-ENTRYPOINT []
-
-CMD ["uv", "run", "sendspin", "daemon"]
+ENTRYPOINT ["uv", "run", "sendspin", "daemon"]
