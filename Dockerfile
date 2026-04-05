@@ -1,6 +1,6 @@
 FROM ghcr.io/astral-sh/uv:python3.14-bookworm
 
-RUN apt-get update && apt-get install -y wireplumber libportaudio2
+RUN apt-get update && apt-get install -y wireplumber libportaudio2 alsa-utils pulseaudio-utils
 
 
 ENV UV_COMPILE_BYTECODE=1
