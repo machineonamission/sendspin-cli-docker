@@ -224,7 +224,11 @@ class SendspinUI:
         """Check if the visualizer needs periodic refreshes for interpolation."""
         if not self._state.visualizer_enabled:
             return False
-        return self._state.visualizer_state.is_active or self._state.beat_state.is_active
+        return (
+            self._state.visualizer_state.is_active
+            or self._state.beat_state.is_active
+            or self._state.peak_state.is_active
+        )
 
     def _next_refresh_interval(self) -> float | None:
         """Return the next periodic refresh interval, if any."""
@@ -784,8 +788,9 @@ class SendspinUI:
     def _build_visualizer_rows(self, height: int) -> list[Text]:
         """Build the visualizer as raw Text rows, totaling `height`.
 
-        Reserves the top row for the beat timeline strip when there's room;
-        the remaining rows are the spectrum.
+        Stacks the peak and beat strips above the spectrum and the f_peak
+        arrow, pitch arrow, and footer below it, dropping lowest-priority
+        rows first on short terminals. The spectrum fills the rest.
         """
         state = self._state.visualizer_state
         state.step()
