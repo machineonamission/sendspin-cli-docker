@@ -7,19 +7,18 @@ import contextlib
 import logging
 import signal
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from aiohttp import ClientError, web
 from aiosendspin.client import ClientListener, SendspinClient
-from aiosendspin.models.core import (
-    ClientGoodbyeMessage,
-    ClientGoodbyePayload,
-    ServerCommandPayload,
-)
+from aiosendspin.models.core import GroupUpdateServerPayload, ServerCommandPayload
 from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFormat
 from aiosendspin_mpris import MPRIS_AVAILABLE, SendspinMpris
 from aiosendspin.models.types import (
+    ConnectionReason,
     GoodbyeReason,
+    PlaybackStateType,
     PlayerCommand,
     Roles,
 )
@@ -52,6 +51,9 @@ class DaemonArgs:
     volume_controller: VolumeController | None = None
     hook_start: str | None = None
     hook_stop: str | None = None
+    manufacturer: str | None = None
+    product_name: str | None = None
+    interface: str | None = None
 
 
 class SendspinDaemon:
@@ -70,11 +72,17 @@ class SendspinDaemon:
         self._audio_handler: AudioStreamHandler | None = None
         self._settings = args.settings
         self._mpris: SendspinMpris | None = None
+        # Currently-applied static delay in milliseconds, mirroring
+        # `SendspinClient.static_delay_ms`. Tracked separately from settings
+        # because CLI overrides aren't persisted to settings, so
+        # `settings.static_delay_ms` can lag the value actually given to the client.
         self._static_delay_ms: float = 0.0
         self._connection_lock: asyncio.Lock | None = None
         self._server_url: str | None = None
+        self._group_update_unsubscribe: Callable[[], None] | None = None
+        self._server_command_unsubscribe: Callable[[], None] | None = None
 
-    def _create_client(self, static_delay_ms: float = 0.0) -> SendspinClient:
+    def _create_client(self) -> SendspinClient:
         """Create a new SendspinClient instance."""
         assert self._audio_handler is not None
         client_roles = [Roles.PLAYER]
@@ -90,13 +98,17 @@ class SendspinDaemon:
             client_id=self._args.client_id,
             client_name=self._args.client_name,
             roles=client_roles,
-            device_info=get_device_info(),
+            device_info=get_device_info(
+                manufacturer=self._args.manufacturer,
+                product_name=self._args.product_name,
+            ),
             player_support=ClientHelloPlayerSupport(
                 supported_formats=supported_formats,
                 buffer_capacity=32_000_000,
                 supported_commands=[PlayerCommand.VOLUME, PlayerCommand.MUTE],
             ),
-            static_delay_ms=static_delay_ms,
+            static_delay_ms=self._static_delay_ms,
+            state_supported_commands=[PlayerCommand.SET_STATIC_DELAY],
             initial_volume=self._audio_handler.volume,
             initial_muted=self._audio_handler.muted,
         )
@@ -125,6 +137,7 @@ class SendspinDaemon:
             if self._args.static_delay_ms is not None
             else self._settings.static_delay_ms
         )
+        self._static_delay_ms = max(0.0, min(5000.0, delay))
 
         self._audio_handler = AudioStreamHandler(
             audio_device=self._args.audio_device,
@@ -141,10 +154,10 @@ class SendspinDaemon:
         try:
             if self._args.url is not None:
                 # Client-initiated connection mode
-                await self._run_client_initiated(delay)
+                await self._run_client_initiated()
             else:
                 # Server-initiated connection mode (listen for incoming connections)
-                await self._run_server_initiated(delay)
+                await self._run_server_initiated()
         except asyncio.CancelledError:
             logger.debug("Daemon cancelled")
         finally:
@@ -173,27 +186,22 @@ class SendspinDaemon:
         if not self._audio_handler.uses_external_volume_controller:
             self._settings.update(player_volume=volume, player_muted=muted)
 
-    async def _run_client_initiated(self, static_delay_ms: float) -> None:
+    async def _run_client_initiated(self) -> None:
         """Run in client-initiated mode, connecting to a specific URL."""
         assert self._args.url is not None
         assert self._audio_handler is not None
-        self._client = self._create_client(static_delay_ms)
-        if MPRIS_AVAILABLE and self._args.use_mpris:
-            self._mpris = SendspinMpris(self._client)
-            self._mpris.start()
-        self._audio_handler.attach_client(self._client)
+        client = self._create_client()
         self._server_url = self._args.url
-        self._client.add_server_command_listener(self._handle_server_command)
+        self._attach_client(client)
         await self._connection_loop(self._args.url)
 
-    async def _run_server_initiated(self, static_delay_ms: float) -> None:
+    async def _run_server_initiated(self) -> None:
         """Run in server-initiated mode, listening for incoming connections."""
         logger.info(
             "Listening for server connections on port %d (mDNS: _sendspin._tcp.local.)",
             self._args.listen_port,
         )
 
-        self._static_delay_ms = static_delay_ms  # Store for use in connection handler
         self._connection_lock = asyncio.Lock()
 
         self._listener = ClientListener(
@@ -201,6 +209,7 @@ class SendspinDaemon:
             on_connection=self._handle_server_connection,
             port=self._args.listen_port,
             client_name=self._args.client_name,
+            host=self._args.interface if self._args.interface is not None else "0.0.0.0",
         )
         await self._listener.start()
 
@@ -208,13 +217,77 @@ class SendspinDaemon:
         while True:
             await asyncio.sleep(3600)
 
-    async def _handle_disconnect(self, *, stop_mpris: bool = True) -> None:
-        """Reset connection-scoped state and optionally stop MPRIS."""
-        if stop_mpris and self._mpris is not None:
+    def _attach_client(self, client: SendspinClient) -> None:
+        """Attach listeners, audio handler, and MPRIS to a client."""
+        assert self._audio_handler is not None
+        self._client = client
+        self._audio_handler.attach_client(client)
+        self._server_command_unsubscribe = client.add_server_command_listener(
+            self._handle_server_command
+        )
+        self._group_update_unsubscribe = client.add_group_update_listener(self._on_group_update)
+        if MPRIS_AVAILABLE and self._args.use_mpris:
+            self._mpris = SendspinMpris(client)
+            self._mpris.start()
+
+    def _detach_client(self) -> None:
+        """Detach listeners, audio handler, and MPRIS from the current client."""
+        if self._server_command_unsubscribe is not None:
+            self._server_command_unsubscribe()
+            self._server_command_unsubscribe = None
+        if self._group_update_unsubscribe is not None:
+            self._group_update_unsubscribe()
+            self._group_update_unsubscribe = None
+        if self._mpris is not None:
             self._mpris.stop()
             self._mpris = None
         if self._audio_handler is not None:
+            self._audio_handler.detach_client()
+
+    async def _handle_disconnect(self) -> None:
+        """Reset audio state after a connection drop."""
+        if self._audio_handler is not None:
             await self._audio_handler.handle_disconnect()
+
+    def _should_switch_to_new_server(
+        self, old_client: SendspinClient, new_client: SendspinClient
+    ) -> bool:
+        """Decide whether to switch to a new server per the multi-server spec.
+
+        Assumes both clients have completed their handshake.
+        """
+        assert new_client.server_info is not None
+
+        # Old client may have disconnected before we acquired the lock.
+        if old_client.server_info is None:
+            return True
+
+        if new_client.server_info.server_id == old_client.server_info.server_id:
+            return True
+
+        new_reason = new_client.server_info.connection_reason
+        old_reason = old_client.server_info.connection_reason
+
+        if new_reason == ConnectionReason.PLAYBACK:
+            return True
+        if old_reason == ConnectionReason.PLAYBACK:
+            return False
+
+        # Both 'discovery' — prefer last played server.
+        if self._settings.last_played_server_id == new_client.server_info.server_id:
+            return True
+
+        return False
+
+    def _on_group_update(self, payload: GroupUpdateServerPayload) -> None:
+        """Track last played server for multi-server arbitration."""
+        if payload.playback_state != PlaybackStateType.PLAYING:
+            return
+        if self._client is None or self._client.server_info is None:
+            return
+        server_id = self._client.server_info.server_id
+        if self._settings.last_played_server_id != server_id:
+            self._settings.update(last_played_server_id=server_id)
 
     async def _handle_server_connection(self, ws: web.WebSocketResponse) -> None:
         """Handle an incoming server connection."""
@@ -226,44 +299,48 @@ class SendspinDaemon:
         # Lock ensures we wait for any in-progress handshake to complete
         # before disconnecting the previous server
         async with self._connection_lock:
-            # Clean up any previous client
-            if self._client is not None:
-                logger.info("Disconnecting from previous server")
-                await self._handle_disconnect()
-                if self._client.connected:
-                    try:
-                        await self._client._send_message(  # noqa: SLF001
-                            ClientGoodbyeMessage(
-                                payload=ClientGoodbyePayload(reason=GoodbyeReason.ANOTHER_SERVER)
-                            ).to_json()
-                        )
-                    except Exception:
-                        logger.debug("Failed to send goodbye message", exc_info=True)
-                await self._client.disconnect()
+            old_client = self._client
 
-            # Create a new client for this connection
-            client = self._create_client(self._static_delay_ms)
-            self._client = client
-            self._audio_handler.attach_client(client)
-            client.add_server_command_listener(self._handle_server_command)
-            if MPRIS_AVAILABLE and self._args.use_mpris:
-                self._mpris = SendspinMpris(client)
-                self._mpris.start()
+            # Per spec: always complete the handshake before deciding which
+            # server to keep.
+            client = self._create_client()
 
             try:
                 await client.attach_websocket(ws)
             except TimeoutError:
                 logger.warning("Handshake with server timed out")
-                await self._handle_disconnect()
-                if self._client is client:
-                    self._client = None
                 return
             except Exception:
                 logger.exception("Error during server handshake")
-                await self._handle_disconnect()
-                if self._client is client:
-                    self._client = None
                 return
+
+            # Decide which server to keep.
+            if old_client is not None:
+                if self._should_switch_to_new_server(old_client, client):
+                    assert client.server_info is not None
+                    logger.info(
+                        "Switching to server '%s' (%s)",
+                        client.server_info.name,
+                        client.server_info.connection_reason.value,
+                    )
+                    self._detach_client()
+                    await self._handle_disconnect()
+                    await old_client.send_goodbye(GoodbyeReason.ANOTHER_SERVER)
+                    await old_client.disconnect()
+                else:
+                    assert old_client.server_info is not None
+                    assert client.server_info is not None
+                    logger.info(
+                        "Keeping server '%s', rejecting '%s' (%s)",
+                        old_client.server_info.name,
+                        client.server_info.name,
+                        client.server_info.connection_reason.value,
+                    )
+                    await client.send_goodbye(GoodbyeReason.ANOTHER_SERVER)
+                    await client.disconnect()
+                    return
+
+            self._attach_client(client)
 
         # Handshake complete, release lock so new connections can proceed
         # Now wait for disconnect (outside the lock)
@@ -278,6 +355,7 @@ class SendspinDaemon:
         finally:
             # Only cleanup if we're still the active client (not replaced by new connection)
             if self._client is client:
+                self._detach_client()
                 await self._handle_disconnect()
 
     async def _connection_loop(self, url: str) -> None:
@@ -301,8 +379,7 @@ class SendspinDaemon:
 
                 # Connection dropped
                 logger.info("Disconnected from server")
-                # Keep MPRIS alive across reconnects in client-initiated mode.
-                await self._handle_disconnect(stop_mpris=False)
+                await self._handle_disconnect()
 
                 logger.info("Reconnecting to %s", url)
 
@@ -334,6 +411,20 @@ class SendspinDaemon:
         elif player_cmd.command == PlayerCommand.MUTE and player_cmd.mute is not None:
             self._audio_handler.set_volume(self._audio_handler.volume, muted=player_cmd.mute)
             logger.info("Server %s player", "muted" if player_cmd.mute else "unmuted")
+        elif (
+            player_cmd.command == PlayerCommand.SET_STATIC_DELAY
+            and player_cmd.static_delay_ms is not None
+        ):
+            # Client library already applied the delay change;
+            # notify audio worker so sync correction adjusts timing gradually
+            assert self._client is not None
+            new_delay_ms = self._client.static_delay_ms
+            delta_us = int((new_delay_ms - self._static_delay_ms) * 1000)
+            if delta_us != 0:
+                self._audio_handler.notify_delay_change(delta_us)
+            self._static_delay_ms = new_delay_ms
+            self._settings.update(static_delay_ms=new_delay_ms)
+            logger.info("Server set delay: %dms", player_cmd.static_delay_ms)
 
     def _handle_format_change(
         self, codec: str | None, sample_rate: int, bit_depth: int, channels: int

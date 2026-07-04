@@ -109,8 +109,8 @@ class AudioPlayer:
     """Maximum DAC-to-loop time ratio to prevent wild extrapolation."""
 
     # Sync error correction: playback speed adjustment range
-    _MAX_SPEED_CORRECTION: Final[float] = 0.04
-    """Maximum playback speed deviation for sync correction (0.04 = ±4% speed variation)."""
+    _MAX_SPEED_CORRECTION: Final[float] = 0.002
+    """Maximum playback speed deviation for sync correction (0.002 = ±0.2% speed variation)."""
 
     # Sync error correction: secondary thresholds (rarely need adjustment)
     _CORRECTION_DEADBAND_US: Final[int] = 2_000
@@ -133,26 +133,40 @@ class AudioPlayer:
     """Minimum threshold for updating start time to avoid churn (5ms)."""
 
     # Sync correction planning
-    _CORRECTION_TARGET_SECONDS: Final[float] = 2.0
-    """Target window to fix sync error through micro-corrections (2 seconds)."""
+    _CORRECTION_TARGET_SECONDS: Final[float] = 8.0
+    """Target window to fix sync error through micro-corrections (8 seconds)."""
+    _CORRECTION_START_GRACE_US: Final[int] = 750_000
+    """Delay sync corrections after startup so DAC/time-sync estimates can settle."""
 
     def __init__(
         self,
         compute_client_time: Callable[[int], int],
         compute_server_time: Callable[[int], int],
+        now_us: Callable[[], int] | None = None,
+        is_clock_synced: Callable[[], bool] | None = None,
     ) -> None:
         """
         Initialize the audio player.
 
         Args:
             compute_client_time: Function that converts server timestamps to client
-                timestamps (monotonic loop time), accounting for clock drift, offset,
+                timestamps (monotonic clock time), accounting for clock drift, offset,
                 and static delay.
             compute_server_time: Function that converts client timestamps (monotonic
-                loop time) to server timestamps (inverse of compute_client_time).
+                clock time) to server timestamps. Pure clock-domain conversion
+                without static delay adjustment.
+            now_us: Function returning current monotonic time in microseconds.
+                Must be in the same clock domain as compute_client_time.
+                Defaults to time.monotonic().
+            is_clock_synced: Returns True when the time filter has converged.
+                Used to tell a real mid-stream join (start time near now, clock
+                trustworthy) apart from the unsynced fallback in compute_play_time
+                (now + 500ms). Defaults to always-True.
         """
         self._compute_client_time = compute_client_time
         self._compute_server_time = compute_server_time
+        self._now_us = now_us or (lambda: int(time.monotonic() * 1_000_000))
+        self._is_clock_synced = is_clock_synced or (lambda: True)
         self._format: PCMFormat | None = None
         self._queue: queue.Queue[_QueuedChunk] = queue.Queue()
         self._stream: sounddevice.RawOutputStream | None = None
@@ -165,6 +179,8 @@ class AudioPlayer:
 
         self._volume: int = 100  # 0-100 range
         self._muted: bool = False
+
+        self._output_latency_us: int = 0
 
         # Partial chunk tracking (to avoid discarding partial chunks)
         self._current_chunk: _QueuedChunk | None = None
@@ -197,6 +213,7 @@ class AudioPlayer:
         # Scheduled start anchoring
         self._scheduled_start_loop_time_us: int | None = None
         self._scheduled_start_dac_time_us: int | None = None
+        self._playback_started_loop_time_us: int = 0
 
         # Server timeline cursor for the next input frame to be consumed
         self._server_ts_cursor_us: int = 0
@@ -206,6 +223,7 @@ class AudioPlayer:
         self._first_server_timestamp_us: int | None = None
         self._early_start_suspect: bool = False
         self._has_reanchored: bool = False
+        self._force_reanchor: bool = True
 
         # Low-overhead drift/sync correction scheduling (sample drop/insert)
         self._insert_every_n_frames: int = 0
@@ -252,13 +270,15 @@ class AudioPlayer:
             latency="high",
             device=device.device_id,
         )
+        self._output_latency_us = int(self._stream.latency * self._MICROSECONDS_PER_SECOND)
         logger.info(
-            "Audio stream configured: codec=%s, sample_rate=%d, channels=%d, bit_depth=%d, blocksize=%d, latency=high, device=%s",
+            "Audio stream configured: codec=%s, sample_rate=%d, channels=%d, bit_depth=%d, blocksize=%d, latency=high, output_latency=%.1f ms, device=%s",
             audio_format.codec.value,
             pcm_format.sample_rate,
             pcm_format.channels,
             pcm_format.bit_depth,
             self._BLOCKSIZE,
+            self._output_latency_us / 1000.0,
             device.device_id,
         )
 
@@ -283,6 +303,20 @@ class AudioPlayer:
         self._volume = max(0, min(100, volume))
         self._muted = muted
 
+    def apply_delay_change(self, delta_us: int) -> None:
+        """Adjust playback timing after a static delay change.
+
+        Offsets the server timestamp cursor so the sync correction mechanism
+        gradually speeds up or slows down playback to match the new delay.
+        This avoids clearing the audio buffer (which the server won't resend).
+
+        Args:
+            delta_us: Delay change in microseconds (positive = delay increased,
+                audio should play earlier, cursor shifts back).
+        """
+        if self._server_ts_cursor_us > 0:
+            self._server_ts_cursor_us -= delta_us
+
     def is_drained(self) -> bool:
         """Return True when the internal audio queue is empty.
 
@@ -290,15 +324,33 @@ class AudioPlayer:
         callback thread updates ``_current_chunk``.  Also returns True
         when the stream is not actively playing (nothing to drain).
         """
+        # Chunks may be buffered before the stream has started (waiting for
+        # the startup buffer to fill); treat them as not-yet-drained so
+        # format switches don't skip the drain loop and play stale PCM.
+        if not self._queue.empty():
+            return False
         if not self._stream_started:
             return True
-        return self._queue.empty() and self._current_chunk is None
+        return self._current_chunk is None
 
     def stop(self) -> None:
         """Stop playback and release resources."""
         self._closed = True
         self._close_stream()
         self._stream_executor.shutdown(wait=True)
+
+    def close_stream(self) -> None:
+        """Drop queued audio and fully close the stream to release the device.
+
+        Unlike clear(), which only stops the stream (leaving the device FD open),
+        this fully closes the PortAudio stream. Call when the server signals
+        end-of-stream; the stream will be recreated by set_format() when the
+        next track begins.
+        """
+        if self._closed:
+            return
+        self.clear()
+        self._close_stream()
 
     def clear(self) -> None:
         """Drop all queued audio chunks."""
@@ -335,11 +387,13 @@ class AudioPlayer:
         self._last_dac_calibration_time_us = 0
         self._scheduled_start_loop_time_us = None
         self._scheduled_start_dac_time_us = None
+        self._playback_started_loop_time_us = 0
         self._server_ts_cursor_us = 0
         self._server_ts_cursor_remainder = 0
         self._first_server_timestamp_us = None
         self._early_start_suspect = False
         self._has_reanchored = False
+        self._force_reanchor = True
         self._insert_every_n_frames = 0
         self._drop_every_n_frames = 0
         self._frames_until_next_insert = 0
@@ -389,6 +443,25 @@ class AudioPlayer:
 
         # Capture exact DAC output time and update playback position
         self._update_playback_position_from_dac(time)
+
+        # Reanchor: snap read cursor to DAC-derived server time so the
+        # cursor tracks actual playback position, not bytes-read position.
+        if (
+            self._playback_state == PlaybackState.PLAYING
+            and self._last_known_playback_position_us > 0
+            and self._server_ts_cursor_us > 0
+            and self._force_reanchor
+        ):
+            self._server_ts_cursor_us = self._last_known_playback_position_us
+            self._server_ts_cursor_remainder = 0
+            self._force_reanchor = False
+            self._insert_every_n_frames = 0
+            self._drop_every_n_frames = 0
+            self._frames_until_next_insert = 0
+            self._frames_until_next_drop = 0
+            self._sync_error_filter.reset()
+            self._sync_error_filtered_us = 0.0
+
         bytes_written = 0
 
         try:
@@ -462,15 +535,19 @@ class AudioPlayer:
                         # Handle correction event if at boundary
                         if frames_remaining > 0:
                             if drop_counter <= 0 and drop_every_n > 0:
-                                # Drop frame: read EXTRA frame to advance cursor faster
-                                _ = self._read_one_input_frame()  # Read frame we're replacing
-                                _ = self._read_one_input_frame()  # Read frame we're DROPPING
+                                # Drop one input frame, then output the following frame. This
+                                # advances the source cursor by two frames while rendering one,
+                                # avoiding the old duplicate-then-skip artifact.
+                                _ = self._read_one_input_frame()
+                                replacement_frame = self._read_one_input_frame()
+                                if replacement_frame is None:
+                                    replacement_frame = self._last_output_frame
                                 drop_counter = drop_every_n
                                 self._frames_dropped_since_log += 1
-                                # Output last frame instead (don't output either frame we read)
                                 output_buffer[bytes_written : bytes_written + frame_size] = (
-                                    self._last_output_frame
+                                    replacement_frame
                                 )
+                                self._last_output_frame = replacement_frame
                                 bytes_written += frame_size
                                 frames_remaining -= 1
                                 insert_counter -= 1
@@ -532,11 +609,10 @@ class AudioPlayer:
                 logger.exception("Failed to estimate playback position")
 
             # If we haven't set the DAC-anchored start yet, approximate it now
-            if self._scheduled_start_dac_time_us is None and self._scheduled_start_loop_time_us:
+            if self._scheduled_start_dac_time_us is None and self._first_server_timestamp_us:
                 try:
-                    loop_start = self._scheduled_start_loop_time_us
                     est_dac = self._estimate_dac_time_for_server_timestamp(
-                        self._compute_server_time(loop_start)
+                        self._first_server_timestamp_us
                     )
                     if est_dac:
                         self._scheduled_start_dac_time_us = est_dac
@@ -761,17 +837,13 @@ class AudioPlayer:
         """Get the current playback position in server timestamp space."""
         return self._last_known_playback_position_us
 
-    @staticmethod
-    def _now_us() -> int:
-        """Return current monotonic time in microseconds."""
-        return int(time.monotonic() * 1_000_000)
-
     def get_timing_metrics(self) -> dict[str, float]:
         """Return current timing metrics for monitoring."""
         return {
             "playback_position_us": float(self._get_current_playback_position_us()),
             "buffered_audio_us": float(self._queued_duration_us),
             "dac_samples_recorded": len(self._dac_loop_calibrations),
+            "output_latency_us": float(self._output_latency_us),
         }
 
     def _log_chunk_timing(self, _server_timestamp_us: int) -> None:
@@ -971,13 +1043,19 @@ class AudioPlayer:
                     // self._MICROSECONDS_PER_SECOND
                 )
                 self._skip_input_frames(frames_to_drop)
-                self._playback_state = PlaybackState.PLAYING
+                self._set_playing()
 
         # If we've reached/overrun the scheduled time, arm playback
         if current_time_us >= target_time_us:
-            self._playback_state = PlaybackState.PLAYING
+            self._set_playing()
 
         return bytes_written
+
+    def _set_playing(self) -> None:
+        """Transition to PLAYING and start the correction grace window once."""
+        if self._playback_state != PlaybackState.PLAYING:
+            self._playback_started_loop_time_us = self._now_us()
+        self._playback_state = PlaybackState.PLAYING
 
     def _update_correction_schedule(self, error_us: int) -> None:
         """Plan occasional sample drop/insert to correct sync error.
@@ -998,28 +1076,29 @@ class AudioPlayer:
 
         abs_err = abs(self._sync_error_filtered_us)
 
+        if self._playback_started_loop_time_us:
+            since_start_us = self._now_us() - self._playback_started_loop_time_us
+            if since_start_us < self._CORRECTION_START_GRACE_US:
+                self._insert_every_n_frames = 0
+                self._drop_every_n_frames = 0
+                return
+
         # Do nothing within deadband
         if abs_err <= self._CORRECTION_DEADBAND_US:
             self._insert_every_n_frames = 0
             self._drop_every_n_frames = 0
             return
 
-        # Re-anchor only if error is very large and cooldown has elapsed
+        # Re-anchor if error is very large and cooldown has elapsed.
         now_loop_us = self._now_us()
         if (
             abs_err > self._REANCHOR_THRESHOLD_US
             and self._playback_state == PlaybackState.PLAYING
             and now_loop_us - self._last_reanchor_loop_time_us > self._REANCHOR_COOLDOWN_US
         ):
-            logger.info("Sync error %.1f ms too large; re-anchoring", abs_err / 1000.0)
-            # Reset cadence
-            self._insert_every_n_frames = 0
-            self._drop_every_n_frames = 0
-            self._frames_until_next_insert = 0
-            self._frames_until_next_drop = 0
+            logger.info("Sync error %.1f ms too large; scheduling reanchor", abs_err / 1000.0)
             self._last_reanchor_loop_time_us = now_loop_us
-            # Re-anchor on next chunk boundary by clearing queue
-            self.clear()
+            self._force_reanchor = True
             return
 
         # Simple proportional control: correction rate proportional to error
@@ -1091,10 +1170,14 @@ class AudioPlayer:
             self._scheduled_start_dac_time_us = est_dac if est_dac else None
             self._playback_state = PlaybackState.WAITING_FOR_START
             self._first_server_timestamp_us = server_timestamp_us
-            # If scheduled start is very near now, suspect unsynchronized fallback mapping
+            # Near-now start with unsynced clock = `compute_play_time` fallback;
+            # suppress catch-up. Synced near-now is a real mid-stream join.
             # Cast: we just set this via _compute_and_set_loop_start so it's not None
             scheduled_start = cast("int", self._scheduled_start_loop_time_us)
-            if scheduled_start - now_us <= self._EARLY_START_THRESHOLD_US:
+            if (
+                scheduled_start - now_us <= self._EARLY_START_THRESHOLD_US
+                and not self._is_clock_synced()
+            ):
                 self._early_start_suspect = True
 
         # While waiting to start, keep the scheduled loop start updated as time sync improves
@@ -1191,8 +1274,15 @@ class AudioPlayer:
             # Update expected position for next chunk
             self._expected_next_timestamp = server_timestamp_us + chunk_duration_us
 
-        # Start stream immediately when first chunk arrives
-        if not self._stream_started and self._queue.qsize() > 0 and self._stream is not None:
+        # Start stream once we have enough buffer to avoid immediate underflow
+        if (
+            not self._stream_started
+            and self._stream is not None
+            and (
+                self._queued_duration_us >= self._MIN_BUFFER_DURATION_US
+                or self._queue.qsize() >= self._MIN_CHUNKS_TO_START
+            )
+        ):
             self._stream_started = True
             self._stream_executor.submit(self._call_stream, self._stream.start)
             logger.info(

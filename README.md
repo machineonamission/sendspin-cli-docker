@@ -19,7 +19,29 @@ When using an explicit app (`daemon`, `serve`, or `player`), put it immediately 
 
 [![A project from the Open Home Foundation](https://www.openhomefoundation.org/badges/ohf-project.png)](https://www.openhomefoundation.org/)
 
-## Quick Start
+## Installation
+
+**Install as daemon (Linux):**
+```bash
+curl -fsSL https://raw.githubusercontent.com/Sendspin/sendspin-cli/refs/heads/main/scripts/systemd/install-systemd.sh | sudo bash
+```
+
+**With uv:**
+```bash
+uv tool install sendspin
+```
+
+Support for Chromecast devices requires installation of extra dependencies:
+```bash
+uv tool install 'sendspin[cast]'
+```
+
+**With pip:**
+```bash
+pip install sendspin
+```
+
+## Try it without installation
 
 **Run directly with [uv](https://docs.astral.sh/uv/getting-started/installation/):**
 
@@ -36,46 +58,6 @@ uvx sendspin serve --demo
 uvx sendspin serve /path/to/media.mp3
 uvx sendspin serve https://retro.dancewave.online/retrodance.mp3
 ```
-
-## Installation
-
-**With uv:**
-```bash
-uv tool install sendspin
-```
-
-Support for Chromecast devices requires installation of extra dependencies:
-```bash
-uv tool install 'sendspin[cast]'
-```
-
-**Install as daemon (Linux):**
-```bash
-curl -fsSL https://raw.githubusercontent.com/Sendspin/sendspin-cli/refs/heads/main/scripts/systemd/install-systemd.sh | sudo bash
-```
-
-**With pip:**
-```bash
-pip install sendspin
-```
-
-<details>
-<summary>Install from source</summary>
-
-```bash
-git clone https://github.com/Sendspin-Protocol/sendspin.git
-cd sendspin
-pip install .
-```
-
-</details>
-
-**After installation, run:**
-```bash
-sendspin
-```
-
-The player will automatically connect to a Sendspin server on your local network and be available for playback.
 
 ## Updating
 
@@ -99,14 +81,11 @@ The systemd daemon preserves your configuration during updates. Simply upgrade t
 # Upgrade sendspin (the daemon installer uses uv by default)
 uv tool upgrade sendspin
 
-# Or if you installed with pip
-pip install --upgrade sendspin
-
 # Restart the service to use the new version
 sudo systemctl restart sendspin
 ```
 
-Your client name, audio device selection, and other settings in `/etc/default/sendspin` are preserved during the update.
+Your client name, audio device selection, and other settings in `~/.config/sendspin/settings-daemon.json` are preserved during the update.
 
 > **Note:** You do **not** need to uninstall and reinstall when updating. Your configuration (client name, audio device, delay settings) is stored separately and will be preserved.
 
@@ -126,7 +105,7 @@ Settings are stored in `~/.config/sendspin/`:
 {
   "player_volume": 50,
   "player_muted": false,
-  "static_delay_ms": -100.0,
+  "static_delay_ms": 0,
   "last_server_url": "ws://192.168.1.100:8927/sendspin",
   "name": "Living Room",
   "client_id": "sendspin-living-room",
@@ -136,7 +115,10 @@ Settings are stored in `~/.config/sendspin/`:
   "listen_port": 8927,
   "use_mpris": true,
   "use_hardware_volume": true,
-  "hook_set_volume": "/usr/local/bin/set-avr-volume"
+  "hook_set_volume": "/usr/local/bin/set-avr-volume",
+  "manufacturer": "Acme Corp",
+  "product_name": "Living Room Speaker",
+  "interface": "192.168.1.5"
 }
 ```
 
@@ -170,6 +152,10 @@ Settings are stored in `~/.config/sendspin/`:
 | `hook_set_volume` | string | TUI/daemon | Script to run for external volume control (`--hook-set-volume`). Receives the effective volume 0-100 as the last argument |
 | `hook_start` | string | TUI/daemon | Command to run when audio stream starts |
 | `hook_stop` | string | TUI/daemon | Command to run when audio stream stops |
+| `manufacturer` | string | TUI/daemon | Manufacturer name reported in the client hello (`--manufacturer`) |
+| `product_name` | string | TUI/daemon | Product name reported in the client hello (`--product-name`); defaults to auto-detected OS/platform name |
+| `interface` | string | TUI/daemon | IP address of the network interface to use (`--interface`) |
+| `visualizer` | boolean | TUI | Render the `visualizer@v1` audio visualizer on launch (default: false). Toggle with `v` in the TUI |
 | `source` | string | serve | Default audio source (file path or URL, ffmpeg input) |
 | `source_format` | string | serve | ffmpeg container format for audio source |
 | `clients` | array | serve | Client URLs to connect to (`--client`) |
@@ -186,7 +172,7 @@ sendspin --url ws://192.168.1.100:8080/sendspin
 
 **List available servers on the network:**
 ```bash
-sendspin --list-servers
+sendspin servers list
 ```
 
 ### Client Identification
@@ -207,7 +193,7 @@ By default, the player uses your system's default audio output device. You can l
 
 **List available audio devices:**
 ```bash
-sendspin --list-audio-devices
+sendspin audio-devices list
 ```
 
 This displays all audio output devices with their IDs, channel configurations, and sample rates. The default device is marked.
@@ -227,7 +213,7 @@ sendspin --audio-device "MacBook"
 sendspin --audio-device dmixer
 ```
 
-This is useful for ALSA plugin devices (dmix, plug, etc.) that don't appear in `--list-audio-devices`. For example, in a dual mono setup where two daemons share a single sound card via dmix, each daemon can target a different ALSA device that routes to a specific channel:
+This is useful for ALSA plugin devices (dmix, plug, etc.) that may not appear in the numbered PortAudio device list (though they may be shown in the ALSA devices section on Linux). For example, in a dual mono setup where two daemons share a single sound card via dmix, each daemon can target a different ALSA device that routes to a specific channel:
 
 ```bash
 # Room 1: left channel via dmix
@@ -283,10 +269,10 @@ Because Sendspin cannot read back external device state from the hook, startup v
 The player supports adjusting playback delay to compensate for audio hardware latency or achieve better synchronization across devices.
 
 ```bash
-sendspin --static-delay-ms -100
+sendspin --static-delay-ms 50
 ```
 
-> **Note:** Based on limited testing, the delay value is typically a negative number (e.g., `-100` or `-150`) to compensate for audio hardware buffering.
+> **Note:** A delay of 0ms works well in most cases. If audio is playing slightly too late, a small positive delay (e.g., 50ms) can help compensate for audio hardware latency. On compatible servers, delay can be configured remotely per player, so you shouldn't need to set this locally.
 
 ### Daemon Mode
 
@@ -303,6 +289,12 @@ sendspin daemon --name "Kitchen" --audio-device 2
 ```
 
 In daemon mode without `--url`, the client listens for incoming server connections and advertises itself via mDNS. The `--name` option (or `name` setting) is used as the friendly name in the mDNS advertisement, making it easy for servers to identify this client on the network.
+
+Use `--manufacturer` and `--product-name` to override the device identity reported to the server in the client hello. This is useful when running the daemon in a container or on a custom device where the auto-detected OS name is not meaningful:
+
+```bash
+sendspin daemon --name "Living Room" --manufacturer "Acme" --product-name "Living Room Speaker"
+```
 
 ### Hooks
 
@@ -330,9 +322,17 @@ Hooks receive these environment variables:
 
 ### Visualizer
 
-The TUI includes a real-time audio spectrum visualizer that displays frequency data received from the server. This uses the experimental `visualizer@_draft_r1` role. The spectrum data is computed on the server and sent via sendspin to the TUI.
+The TUI includes a real-time audio visualizer driven by the `visualizer@v1` role. All analysis is computed on the server and streamed to the TUI, time-aligned to the audio playhead. It shows:
 
-Toggle it by pressing `v` in the TUI. Your preference is saved in settings and remembered on next launch.
+- **Spectrum bars** — frequency magnitude across the range, tinted by overall loudness (and by the album-artwork palette when the server provides one).
+- **Beats timeline** — a `beats (NNN BPM):` strip with the estimated tempo; downbeats render differently from regular beats.
+- **Peaks timeline** — a `peaks:` strip of energy onsets (transients like drum hits), independent of the beat grid, with glyph height scaled by onset strength.
+- **Pitch** — the perceived musical note (e.g. `A4`) with an arrow pointing at its position on the spectrum, shown whenever a pitch is detected.
+- **Dominant frequency** — an `f_peak:` readout with an arrow marking the loudest frequency on the spectrum.
+
+Lower rows are dropped first on short terminals, keeping the spectrum visible.
+
+Toggle the visualizer by pressing `v` in the TUI. Your preference is saved in settings and remembered on next launch.
 
 ### Debugging & Troubleshooting
 
@@ -343,6 +343,22 @@ sendspin --log-level DEBUG
 ```
 
 This provides detailed information about time synchronization. The output can be helpful when reporting issues.
+
+### Network Interface Binding
+
+On machines with multiple network interfaces (e.g., a home server with both a LAN and a WAN/internet interface), you can restrict Sendspin to a specific interface using `--interface`:
+
+```bash
+sendspin --interface 192.168.1.5
+sendspin daemon --interface 192.168.1.5
+```
+
+The `--interface` option takes the **IP address** of the interface to use. This affects:
+
+- **mDNS discovery**: only servers advertising on that interface will be found.
+- **Daemon listening mode** (no `--url`): the incoming-connection server binds only to that IP, so servers on other interfaces (e.g., the WAN) cannot connect.
+
+This is useful when you want Sendspin to be accessible only on your LAN, not on the internet-facing interface.
 
 ## Install as Daemon (systemd, Linux)
 
@@ -367,7 +383,7 @@ sudo systemctl status sendspin   # Check status
 journalctl -u sendspin -f        # View logs
 ```
 
-**Configuration:** Edit `/etc/default/sendspin` to change client name, audio device, or delay settings.
+**Configuration:** Edit `~/.config/sendspin/settings-daemon.json` to change client name, audio device, or other settings.
 
 **Uninstall:**
 ```bash
@@ -390,3 +406,15 @@ uvx sendspin serve /path/to/media.mp3
 # Connect to specific clients
 sendspin serve --demo --client ws://192.168.1.50:8927/sendspin --client ws://192.168.1.51:8927/sendspin
 ```
+
+### Multi-Worker Mode
+
+For serving many concurrent listeners, use `--workers` to run multiple server processes behind a reverse proxy:
+
+```bash
+sendspin serve --demo --workers 4
+```
+
+This spawns 4 worker processes on consecutive ports starting from `--port` (default 8927), so ports 8927-8930. Place a reverse proxy (e.g., nginx, Caddy) in front with load balancing across these ports.
+
+Note: `--client` is not supported with `--workers`.

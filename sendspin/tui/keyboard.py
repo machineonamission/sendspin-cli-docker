@@ -32,6 +32,7 @@ class CommandHandler:
         audio_handler: AudioStreamHandler,
         ui: SendspinUI,
         settings: ClientSettings,
+        on_delay_changed: Callable[[float], None] | None = None,
     ) -> None:
         """Initialize the command handler."""
         self._get_client = get_client
@@ -39,6 +40,7 @@ class CommandHandler:
         self._audio_handler = audio_handler
         self._ui = ui
         self._settings = settings
+        self._on_delay_changed = on_delay_changed
 
     async def send_media_command(self, command: MediaCommand) -> None:
         """Send a media command with validation."""
@@ -112,9 +114,17 @@ class CommandHandler:
         client = self._get_client()
         if client is None:
             return
-        client.set_static_delay_ms(client.static_delay_ms + delta)
+        old_delay = client.static_delay_ms
+        new_delay = max(0, min(5000, old_delay + delta))
+        client.set_static_delay_ms(new_delay)
+        actual_delta_us = int((client.static_delay_ms - old_delay) * 1000)
+        if actual_delta_us != 0:
+            self._audio_handler.notify_delay_change(actual_delta_us)
         self._ui.set_delay(client.static_delay_ms)
         self._settings.update(static_delay_ms=client.static_delay_ms)
+        if self._on_delay_changed is not None:
+            self._on_delay_changed(client.static_delay_ms)
+        self._audio_handler.send_player_volume()
 
     def close_server_selector(self) -> None:
         """Close the server selector panel."""
@@ -131,6 +141,7 @@ async def keyboard_loop(
     on_server_selected: Callable[[], Awaitable[None]],
     request_shutdown: Callable[[], None],
     on_toggle_visualizer: Callable[[], Awaitable[None]],
+    on_delay_changed: Callable[[float], None] | None = None,
 ) -> None:
     """Run the keyboard input loop.
 
@@ -144,8 +155,18 @@ async def keyboard_loop(
         on_server_selected: Async callback when a server is selected.
         request_shutdown: Callback to request application shutdown.
         on_toggle_visualizer: Async callback to toggle the visualizer.
+        on_delay_changed: Optional callback invoked with the new static delay
+            (milliseconds) after a local adjust, so the app can keep its
+            applied-delay tracker in sync.
     """
-    handler = CommandHandler(get_client, state, audio_handler, ui, settings)
+    handler = CommandHandler(
+        get_client,
+        state,
+        audio_handler,
+        ui,
+        settings,
+        on_delay_changed=on_delay_changed,
+    )
 
     # Key dispatch table: key -> (highlight_name | None, action)
     # Actions can be sync or async. For keys that need case-insensitive matching, use lowercase.
@@ -157,6 +178,7 @@ async def keyboard_loop(
         "r": ("repeat", handler.cycle_repeat),
         "x": ("shuffle", handler.toggle_shuffle),
         "v": ("visualizer", on_toggle_visualizer),
+        "t": ("theme", ui.cycle_color_mode),
         # Delay adjustment
         ",": ("delay-", lambda: handler.adjust_delay(-10)),
         ".": ("delay+", lambda: handler.adjust_delay(10)),

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 from aiosendspin.models.core import StreamStartMessage
-from aiosendspin.models.types import AudioCodec, ClientStateType, Roles
+from aiosendspin.models.types import AudioCodec, ClientStateType
 
 from sendspin.audio import AudioPlayer
 from sendspin.audio_devices import AudioDevice
@@ -50,11 +50,30 @@ class _SetVolumeWorkItem:
 
 
 @dataclass(slots=True)
+class _DelayChangeWorkItem:
+    """Delay change notification for the synchronous audio worker."""
+
+    delta_us: int
+
+
+@dataclass(slots=True)
 class _StopWorkItem:
     """Stop signal for the synchronous audio worker."""
 
 
-type _AudioWorkItem = _ChunkWorkItem | _ClearWorkItem | _SetVolumeWorkItem | _StopWorkItem
+@dataclass(slots=True)
+class _CloseStreamWorkItem:
+    """Close the audio stream and release the audio device on stream end."""
+
+
+type _AudioWorkItem = (
+    _ChunkWorkItem
+    | _ClearWorkItem
+    | _SetVolumeWorkItem
+    | _DelayChangeWorkItem
+    | _StopWorkItem
+    | _CloseStreamWorkItem
+)
 
 
 class _AudioSyncWorker:
@@ -80,11 +99,15 @@ class _AudioSyncWorker:
         self,
         compute_play_time: Callable[[int], int],
         compute_server_time: Callable[[int], int],
+        now_us: Callable[[], int] | None = None,
+        is_clock_synced: Callable[[], bool] | None = None,
     ) -> None:
         """Start worker thread if needed."""
         if self._thread is not None and self._thread.is_alive():
             return
 
+        self._now_us = now_us
+        self._is_clock_synced = is_clock_synced
         self._queue = queue.Queue(maxsize=512)
         self._thread = threading.Thread(
             target=self._run,
@@ -107,6 +130,14 @@ class _AudioSyncWorker:
     def clear(self) -> None:
         """Clear queued audio on worker."""
         self._enqueue(_ClearWorkItem())
+
+    def close_stream(self) -> None:
+        """Clear queued audio and close the stream to release the audio device."""
+        self._enqueue(_CloseStreamWorkItem())
+
+    def notify_delay_change(self, delta_us: int) -> None:
+        """Notify the worker that static delay changed."""
+        self._enqueue(_DelayChangeWorkItem(delta_us=delta_us))
 
     def set_volume(self, volume: int, *, muted: bool) -> None:
         """Update software volume and forward to worker if enabled."""
@@ -159,7 +190,12 @@ class _AudioSyncWorker:
         if queue_obj is None:
             return
 
-        player = AudioPlayer(compute_play_time, compute_server_time)
+        player = AudioPlayer(
+            compute_play_time,
+            compute_server_time,
+            now_us=self._now_us,
+            is_clock_synced=self._is_clock_synced,
+        )
         current_format: AudioFormat | None = None
         flac_decoder: FlacDecoder | None = None
         software_volume = self._initial_volume
@@ -183,6 +219,15 @@ class _AudioSyncWorker:
                 player.clear()
                 continue
 
+            if item_type is _CloseStreamWorkItem:
+                player.close_stream()
+                current_format = None  # force set_format() when next track begins
+                continue
+
+            if item_type is _DelayChangeWorkItem:
+                player.apply_delay_change(cast(_DelayChangeWorkItem, item).delta_us)
+                continue
+
             if item_type is _SetVolumeWorkItem:
                 if self._use_software_volume:
                     volume_item = cast(_SetVolumeWorkItem, item)
@@ -199,6 +244,7 @@ class _AudioSyncWorker:
                 buffered_chunks: list[_ChunkWorkItem] = [chunk_item]
                 drained = player.is_drained()
                 deadline = time.monotonic() + 60.0
+                close_requested = False
 
                 while not drained and time.monotonic() < deadline:
                     try:
@@ -211,8 +257,12 @@ class _AudioSyncWorker:
                     if drain_type is _StopWorkItem:
                         player.stop()
                         return
-                    if drain_type is _ClearWorkItem:
-                        player.clear()
+                    if drain_type is _ClearWorkItem or drain_type is _CloseStreamWorkItem:
+                        if drain_type is _CloseStreamWorkItem:
+                            player.close_stream()
+                            close_requested = True
+                        else:
+                            player.clear()
                         buffered_chunks.clear()
                         drained = True
                         break
@@ -222,6 +272,9 @@ class _AudioSyncWorker:
                         software_muted = vol.muted
                         player.set_volume(software_volume, muted=software_muted)
                         continue
+                    if drain_type is _DelayChangeWorkItem:
+                        player.apply_delay_change(cast(_DelayChangeWorkItem, drain_item).delta_us)
+                        continue
                     # Buffer incoming new-format chunks during drain
                     buffered_chunks.append(cast(_ChunkWorkItem, drain_item))
                     drained = player.is_drained()
@@ -229,6 +282,10 @@ class _AudioSyncWorker:
                 if not drained:
                     logger.warning("Drain timeout during format switch; forcing clear")
                     player.clear()
+
+                if close_requested:
+                    current_format = None
+                    continue
 
                 current_format = fmt
                 player.set_format(fmt, device=self._audio_device)
@@ -322,6 +379,7 @@ class AudioStreamHandler:
         self._client_unsubscribers: list[Callable[[], None]] = []
 
         self._volume_controller: VolumeController | None = volume_controller
+        self._chunks_dropping = False
 
     @property
     def volume(self) -> int:
@@ -432,9 +490,20 @@ class AudioStreamHandler:
                 muted=self._muted,
             )
 
-        self._audio_worker.start(client.compute_play_time, client.compute_server_time)
+        self._audio_worker.start(
+            client.compute_play_time,
+            client.compute_server_time,
+            client.now_us,
+            client.is_time_synchronized,
+        )
         if not self._audio_worker.is_running():
             raise RuntimeError("Audio worker failed to start")
+
+    def notify_delay_change(self, delta_us: int) -> None:
+        """Notify the audio worker that static delay changed."""
+        worker = self._audio_worker
+        if worker is not None and worker.is_running():
+            worker.notify_delay_change(delta_us)
 
     def _clear_audio_worker(self) -> None:
         """Clear worker queue when worker is available."""
@@ -448,7 +517,11 @@ class AudioStreamHandler:
         """Handle incoming audio chunks by enqueueing them to the sync worker."""
         worker = self._audio_worker
         if worker is None or not worker.is_running():
-            raise RuntimeError("Audio worker is not running")
+            if not self._chunks_dropping:
+                logger.debug("Audio chunks dropping: worker not running")
+                self._chunks_dropping = True
+            return
+        self._chunks_dropping = False
 
         pcm_format = fmt.pcm_format
         if self._current_format != fmt:
@@ -480,11 +553,13 @@ class AudioStreamHandler:
                 self._on_event("start")
 
     def _on_stream_end(self, roles: list[str] | None) -> None:
-        """Handle stream end by clearing audio queue."""
-        if roles is not None and Roles.PLAYER.value not in roles:
+        """Handle stream end by closing the audio stream to release the audio device."""
+        if roles is not None and "player" not in roles:
             return
 
-        self._clear_audio_worker()
+        worker = self._audio_worker
+        if worker is not None and worker.is_running():
+            worker.close_stream()
 
         if self._stream_active:
             self._stream_active = False
@@ -493,7 +568,7 @@ class AudioStreamHandler:
 
     def _on_stream_clear(self, roles: list[str] | None) -> None:
         """Handle stream clear by clearing audio queue (e.g., for seek operations)."""
-        if roles is None or Roles.PLAYER.value in roles:
+        if roles is None or "player" in roles:
             self._clear_audio_worker()
 
     def clear_queue(self) -> None:

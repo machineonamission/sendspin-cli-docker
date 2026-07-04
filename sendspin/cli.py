@@ -41,7 +41,9 @@ Please install PortAudio for your system:
   • Other systems: https://www.portaudio.com/"""
 
 PLAYER_APP_SENTINEL = "player"
-EXPLICIT_APPS = frozenset({PLAYER_APP_SENTINEL, "daemon", "serve"})
+EXPLICIT_APPS = frozenset(
+    {PLAYER_APP_SENTINEL, "daemon", "serve", "audio-devices", "servers", "clients"}
+)
 TOP_LEVEL_ACTIONS = frozenset({"-h", "--help", "--version"})
 
 
@@ -59,6 +61,25 @@ def arg_str_to_bool(v: str) -> bool:
     if s == "false":
         return False
     raise argparse.ArgumentTypeError("Expected true or false")
+
+
+def _set_pulse_client_metadata() -> None:
+    """Identify the audio stream as Sendspin to the desktop sound server.
+
+    libpulse reads these env vars when it opens the client connection
+    (used by the ALSA ``pulse`` / ``pipewire`` plug devices and by
+    pipewire-pulse). Without them, the stream registers under a generic
+    name like ``ALSA plug-in [python3]``. Only set values that aren't
+    already in the environment so the user can override.
+    """
+    defaults = {
+        "PULSE_PROP_application.name": "Sendspin",
+        "PULSE_PROP_application.id": "org.sendspin.cli",
+        "PULSE_PROP_application.icon_name": "audio-x-generic",
+        "PULSE_PROP_media.role": "music",
+    }
+    for key, value in defaults.items():
+        os.environ.setdefault(key, value)
 
 
 def list_audio_devices() -> None:
@@ -92,6 +113,7 @@ def list_audio_devices() -> None:
         )
     if devices:
         print(f"\nTo select an audio device:\n  sendspin --audio-device {devices[0].index}")
+        print(f"  sendspin daemon --audio-device {devices[0].index}")
 
     if sys.platform.startswith("linux"):
         alsa_devices = list_alsa_devices()
@@ -102,6 +124,19 @@ def list_audio_devices() -> None:
                 print(f"  {name}")
                 if description:
                     print(f"       {description}")
+
+            alsa_names = {name for name, _ in alsa_devices}
+            recommended = [
+                ("pulse", "Routes through PulseAudio"),
+                ("pipewire", "Routes through PipeWire"),
+                ("default", "System default"),
+            ]
+            recommended = [(n, d) for n, d in recommended if n in alsa_names]
+            if recommended:
+                print("\nRecommended for desktop usage:")
+                print()
+                for name, description in recommended:
+                    print(f"  {name:<12} {description}")
 
 
 def _add_player_runtime_options(target: ArgumentTarget, *, suppress_defaults: bool = False) -> None:
@@ -143,7 +178,8 @@ def _add_player_runtime_options(target: ArgumentTarget, *, suppress_defaults: bo
         help=(
             "Audio output device by index (e.g., 0, 1, 2), name prefix (e.g., 'MacBook'), "
             "or raw ALSA device name (e.g., 'dmixer', 'olohuone') for plugin devices like dmix. "
-            "Use --list-audio-devices to see enumerated devices."
+            "On Linux desktops, 'pulse', 'pipewire', or 'default' route through the sound "
+            "server. Use 'sendspin audio-devices list' to see enumerated devices."
         ),
     )
     target.add_argument(
@@ -169,6 +205,18 @@ def _add_player_runtime_options(target: ArgumentTarget, *, suppress_defaults: bo
         help="Enable or disable hardware/system volume control (daemon: on, TUI: off)",
     )
     target.add_argument(
+        "--manufacturer",
+        type=str,
+        default=default,
+        help="Manufacturer name reported in the client hello (e.g., 'Acme Corp')",
+    )
+    target.add_argument(
+        "--product-name",
+        type=str,
+        default=default,
+        help="Product name reported in the client hello (defaults to auto-detected OS/platform name)",
+    )
+    target.add_argument(
         "--hook-start",
         type=str,
         default=default,
@@ -186,6 +234,16 @@ def _add_player_runtime_options(target: ArgumentTarget, *, suppress_defaults: bo
         default=default,
         help="Command to run when audio stream stops (receives SENDSPIN_* env vars)",
     )
+    target.add_argument(
+        "--interface",
+        type=str,
+        default=default,
+        help=(
+            "IP address of the network interface to use for mDNS discovery. "
+            "Restricts discovery to servers on the specified interface only. "
+            "Useful when the system has multiple interfaces (e.g., LAN and WAN)."
+        ),
+    )
 
 
 def _add_player_actions(target: ArgumentTarget, *, suppress_defaults: bool = False) -> None:
@@ -194,19 +252,19 @@ def _add_player_actions(target: ArgumentTarget, *, suppress_defaults: bool = Fal
         "--list-audio-devices",
         action="store_true",
         default=argparse.SUPPRESS if suppress_defaults else False,
-        help="List available audio output devices and exit",
+        help="(deprecated: use 'sendspin audio-devices list') List audio devices and exit",
     )
     target.add_argument(
         "--list-servers",
         action="store_true",
         default=argparse.SUPPRESS if suppress_defaults else False,
-        help="Discover and list available Sendspin servers on the network",
+        help="(deprecated: use 'sendspin servers list') List Sendspin servers and exit",
     )
     target.add_argument(
         "--list-clients",
         action="store_true",
         default=argparse.SUPPRESS if suppress_defaults else False,
-        help="Discover and list available Sendspin clients on the network",
+        help="(deprecated: use 'sendspin clients list') List Sendspin clients and exit",
     )
     target.add_argument(
         "--headless",
@@ -291,6 +349,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Client URL to connect to (can be specified multiple times)",
     )
+    serve_parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of server worker processes (default: 1)",
+    )
 
     # Daemon subcommand
     daemon_parser = subparsers.add_parser(
@@ -344,8 +408,10 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help=(
-            "Audio output device by index (e.g., 0, 1, 2) or name prefix (e.g., 'MacBook'). "
-            "Use --list-audio-devices to see available devices."
+            "Audio output device by index (e.g., 0, 1, 2), name prefix (e.g., 'MacBook'), "
+            "or raw ALSA device name (e.g., 'dmixer', 'olohuone') for plugin devices like dmix. "
+            "On Linux desktops, 'pulse', 'pipewire', or 'default' route through the sound "
+            "server. Use 'sendspin audio-devices list' to see available devices."
         ),
     )
     daemon_parser.add_argument(
@@ -392,6 +458,80 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Command to run when audio stream stops (receives SENDSPIN_* env vars)",
+    )
+    daemon_parser.add_argument(
+        "--manufacturer",
+        type=str,
+        default=None,
+        help="Manufacturer name reported in the client hello (e.g., 'Acme Corp')",
+    )
+    daemon_parser.add_argument(
+        "--product-name",
+        type=str,
+        default=None,
+        help="Product name reported in the client hello (defaults to auto-detected OS/platform name)",
+    )
+    daemon_parser.add_argument(
+        "--interface",
+        type=str,
+        default=None,
+        help=(
+            "IP address of the network interface to bind to. "
+            "In server-initiated mode (no --url), restricts the listening server to this "
+            "interface only. Also restricts mDNS discovery to this interface. "
+            "Useful when the system has multiple interfaces (e.g., LAN and WAN)."
+        ),
+    )
+
+    # audio-devices subcommand
+    audio_devices_parser = subparsers.add_parser(
+        "audio-devices",
+        help="Audio device utilities",
+        description="Audio device utilities.",
+    )
+    audio_devices_sub = audio_devices_parser.add_subparsers(
+        dest="audio_devices_command",
+        title="Commands",
+        required=True,
+    )
+    audio_devices_sub.add_parser(
+        "list",
+        help="List available audio output devices",
+        description="List all available audio output devices and exit.",
+    )
+
+    # servers subcommand
+    servers_parser = subparsers.add_parser(
+        "servers",
+        help="Server discovery utilities",
+        description="Server discovery utilities.",
+    )
+    servers_sub = servers_parser.add_subparsers(
+        dest="servers_command",
+        title="Commands",
+        required=True,
+    )
+    servers_sub.add_parser(
+        "list",
+        help="Discover and list available Sendspin servers on the network",
+        description="Discover and list available Sendspin servers on the network.",
+    )
+
+    # clients subcommand
+    clients_parser = subparsers.add_parser(
+        "clients",
+        help="Client discovery utilities",
+        description="Client discovery utilities.",
+    )
+    clients_sub = clients_parser.add_subparsers(
+        dest="clients_command",
+        title="Commands",
+        required=True,
+    )
+    clients_sub.add_parser(
+        "list",
+        help="Discover and list available Sendspin clients on the network",
+        description="Discover and list available Sendspin clients on the network.",
     )
 
     return parser
@@ -503,7 +643,7 @@ def _resolve_preferred_format(
 
 async def _run_serve_mode(args: argparse.Namespace) -> int:
     """Run the server mode."""
-    from sendspin.serve import ServeConfig, run_server
+    from sendspin.serve import ServeConfig, run_server, run_server_multi
 
     # Load settings for serve mode
     settings = await get_serve_settings()
@@ -539,6 +679,17 @@ async def _run_serve_mode(args: argparse.Namespace) -> int:
         name=args.name,
         clients=args.clients or settings.clients,
     )
+    if args.workers < 1:
+        print("Error: --workers must be at least 1")
+        return 1
+
+    if args.workers > 1 and serve_config.clients:
+        print("Error: --client is not supported with --workers")
+        return 1
+
+    if args.workers > 1:
+        return await run_server_multi(serve_config, workers=args.workers, log_level=args.log_level)
+
     return await run_server(serve_config)
 
 
@@ -566,6 +717,9 @@ async def _run_daemon_mode(
         volume_controller=volume_controller,
         hook_start=args.hook_start,
         hook_stop=args.hook_stop,
+        manufacturer=args.manufacturer,
+        product_name=args.product_name,
+        interface=args.interface,
     )
 
     daemon = SendspinDaemon(daemon_args)
@@ -574,6 +728,8 @@ async def _run_daemon_mode(
 
 def main() -> int:
     """Run the CLI client."""
+    if sys.platform.startswith("linux"):
+        _set_pulse_client_metadata()
     args = parse_args(sys.argv[1:])
 
     # Handle serve subcommand
@@ -587,17 +743,38 @@ def main() -> int:
             traceback.print_exc()
             return 1
 
+    # Handle utility subcommands
+    if args.command == "audio-devices":
+        if args.audio_devices_command == "list":
+            list_audio_devices()
+            return 0
+
+    if args.command == "servers":
+        if args.servers_command == "list":
+            asyncio.run(list_servers())
+            return 0
+
+    if args.command == "clients":
+        if args.clients_command == "list":
+            asyncio.run(list_clients())
+            return 0
+
     if args.command == PLAYER_APP_SENTINEL:
-        # Handle player-only actions before starting async runtime.
+        # Deprecated flags - route to new subcommands with a warning.
         if args.list_audio_devices:
+            print(
+                "Warning: --list-audio-devices is deprecated. Use 'sendspin audio-devices list'.\n"
+            )
             list_audio_devices()
             return 0
 
         if args.list_servers:
+            print("Warning: --list-servers is deprecated. Use 'sendspin servers list'.\n")
             asyncio.run(list_servers())
             return 0
 
         if args.list_clients:
+            print("Warning: --list-clients is deprecated. Use 'sendspin clients list'.\n")
             asyncio.run(list_clients())
             return 0
 
@@ -670,6 +847,12 @@ async def _run_client_mode(args: argparse.Namespace) -> int:
         args.hook_start = settings.hook_start
     if args.hook_stop is None:
         args.hook_stop = settings.hook_stop
+    if args.manufacturer is None:
+        args.manufacturer = settings.manufacturer
+    if args.product_name is None:
+        args.product_name = settings.product_name
+    if args.interface is None:
+        args.interface = settings.interface
 
     # Set up logging: daemon uses stderr, TUI writes to sendspin.log
     # so log output doesn't interfere with the Rich display.
@@ -733,6 +916,9 @@ async def _run_client_mode(args: argparse.Namespace) -> int:
         volume_controller=volume_controller,
         hook_start=args.hook_start,
         hook_stop=args.hook_stop,
+        manufacturer=args.manufacturer,
+        product_name=args.product_name,
+        interface=args.interface,
     )
 
     app = SendspinApp(app_args)

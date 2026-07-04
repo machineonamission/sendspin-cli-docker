@@ -13,44 +13,62 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from aiosendspin.models.metadata import SessionUpdateMetadata
+
     from sendspin.volume_controller import VolumeController
 
 from aiohttp import ClientError
 from aiosendspin.client import SendspinClient
-from aiosendspin_mpris import MPRIS_AVAILABLE, SendspinMpris
+from aiosendspin.models.artwork import ArtworkChannel, ClientHelloArtworkSupport
 from aiosendspin.models.core import (
     GroupUpdateServerPayload,
     ServerCommandPayload,
+    ServerHelloPayload,
     ServerStatePayload,
+    StreamStartMessage,
 )
 from aiosendspin.models.player import (
     ClientHelloPlayerSupport,
     PlayerCommandPayload,
     SupportedAudioFormat,
 )
-from aiosendspin.models.visualizer import (
-    ClientHelloVisualizerSpectrum,
-    ClientHelloVisualizerSupport,
-    VisualizerFrame,
-)
 from aiosendspin.models.types import (
+    ArtworkSource,
     MediaCommand,
+    PictureFormat,
     PlaybackStateType,
     PlayerCommand,
     RepeatMode,
     Roles,
     UndefinedField,
 )
+from aiosendspin.models.visualizer import (
+    BeatTiming,
+    ClientHelloVisualizerSpectrum,
+    ClientHelloVisualizerSupport,
+    StreamStartVisualizer,
+    VisualizerFrame,
+)
+from aiosendspin_mpris import MPRIS_AVAILABLE, SendspinMpris
+from PIL.Image import Image as PILImage
 
-from sendspin.audio_devices import AudioDevice, detect_supported_audio_formats
+from sendspin.artwork_connector import ArtworkHandler
 from sendspin.audio_connector import AudioStreamHandler
-from sendspin.discovery import ServiceDiscovery, DiscoveredServer
+from sendspin.audio_devices import AudioDevice, detect_supported_audio_formats
+from sendspin.discovery import DiscoveredServer, ServiceDiscovery
 from sendspin.hooks import run_hook
 from sendspin.settings import ClientSettings
+from sendspin.tui.artwork import detect_support as detect_artwork_support
 from sendspin.tui.keyboard import keyboard_loop
-from sendspin.tui.ui import SendspinUI
+from sendspin.tui.ui import ColorMode, SendspinUI
+from sendspin.tui.visualizer import (
+    SPECTRUM_F_MAX,
+    SPECTRUM_F_MIN,
+    SPECTRUM_N_BINS,
+    SPECTRUM_SCALE,
+    PeakEvent,
+)
 from sendspin.utils import create_task, get_device_info
-from sendspin.visualizer_connector import VisualizerHandler
+from sendspin.visualizer_connector import BeatHandler, PeakHandler, VisualizerHandler
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +246,9 @@ class AppArgs:
     volume_controller: VolumeController | None = None
     hook_start: str | None = None
     hook_stop: str | None = None
+    manufacturer: str | None = None
+    product_name: str | None = None
+    interface: str | None = None
 
 
 class SendspinApp:
@@ -248,58 +269,87 @@ class SendspinApp:
         self._client: SendspinClient | None = None
         self._audio_handler: AudioStreamHandler | None = None
         self._visualizer_handler: VisualizerHandler | None = None
+        self._beat_handler: BeatHandler | None = None
+        self._peak_handler: PeakHandler | None = None
+        self._artwork_handler: ArtworkHandler | None = None
         self._settings = args.settings
         self._visualizer_enabled: bool = args.settings.visualizer
-        self._discovery = ServiceDiscovery()
+        # Probe terminal graphics support before Rich Live takes the tty.
+        self._supports_artwork: bool = detect_artwork_support()
+        # Currently-applied static delay in milliseconds, mirroring
+        # `SendspinClient.static_delay_ms`. Tracked separately from settings
+        # because CLI overrides aren't persisted to settings, so
+        # `settings.static_delay_ms` can lag the value actually given to the client.
+        self._applied_delay_ms: float = 0.0
+        interfaces = [args.interface] if args.interface else None
+        self._discovery = ServiceDiscovery(interfaces=interfaces)
         self._connection_manager = ConnectionManager(self._discovery)
         self._connect_task: asyncio.Task[None] | None = None
         self._mpris: SendspinMpris | None = None
         self._listener_unsubscribes: list[Callable[[], None]] = []
 
     @staticmethod
+    def _build_artwork_support() -> ClientHelloArtworkSupport:
+        """Build artwork support payload for client/hello (artwork@v1)."""
+        return ClientHelloArtworkSupport(
+            channels=[
+                ArtworkChannel(
+                    source=ArtworkSource.ALBUM,
+                    format=PictureFormat.PNG,
+                    media_width=128,
+                    media_height=128,
+                ),
+            ],
+        )
+
+    @staticmethod
     def _build_visualizer_support() -> ClientHelloVisualizerSupport:
-        """Build visualizer support payload for client/hello."""
+        """Build visualizer support payload for client/hello (visualizer@v1)."""
         return ClientHelloVisualizerSupport(
             buffer_capacity=65536,
-            types=["loudness", "spectrum"],
-            batch_max=8,
+            types=["loudness", "spectrum", "beat", "peak", "f_peak", "pitch"],
+            rate_max=30,
             spectrum=ClientHelloVisualizerSpectrum(
-                n_disp_bins=48,
-                scale="mel",
-                f_min=20,
-                f_max=20000,
-                rate_max=30,
+                n_disp_bins=SPECTRUM_N_BINS,
+                scale=SPECTRUM_SCALE,
+                f_min=SPECTRUM_F_MIN,
+                f_max=SPECTRUM_F_MAX,
             ),
         )
 
     def _create_client(self) -> SendspinClient:
         """Create a new SendspinClient with roles based on current visualizer state."""
         args = self._args
-        roles = [Roles.CONTROLLER, Roles.PLAYER, Roles.METADATA]
+        roles = [Roles.CONTROLLER, Roles.PLAYER, Roles.METADATA, Roles.COLOR]
         visualizer_support = None
         if self._visualizer_enabled:
             visualizer_support = self._build_visualizer_support()
             roles.append(Roles.VISUALIZER)
 
+        artwork_support: ClientHelloArtworkSupport | None = None
+        if self._supports_artwork:
+            artwork_support = self._build_artwork_support()
+            roles.append(Roles.ARTWORK)
+
         assert self._audio_handler is not None
-        delay = (
-            args.static_delay_ms
-            if args.static_delay_ms is not None
-            else self._settings.static_delay_ms
-        )
 
         return SendspinClient(
             client_id=args.client_id,
             client_name=args.client_name,
             roles=roles,
-            device_info=get_device_info(),
+            device_info=get_device_info(
+                manufacturer=args.manufacturer,
+                product_name=args.product_name,
+            ),
             player_support=ClientHelloPlayerSupport(
                 supported_formats=self._supported_formats,
                 buffer_capacity=32_000_000,
                 supported_commands=[PlayerCommand.VOLUME, PlayerCommand.MUTE],
             ),
             visualizer_support=visualizer_support,
-            static_delay_ms=delay,
+            artwork_support=artwork_support,
+            static_delay_ms=self._applied_delay_ms,
+            state_supported_commands=[PlayerCommand.SET_STATIC_DELAY],
             initial_volume=self._audio_handler.volume,
             initial_muted=self._audio_handler.muted,
         )
@@ -314,14 +364,40 @@ class SendspinApp:
             self._client.add_group_update_listener(self._handle_group_update),
             self._client.add_controller_state_listener(self._handle_server_state),
             self._client.add_server_command_listener(self._handle_server_command),
+            self._client.add_color_listener(self._handle_color_update),
+            self._client.add_server_hello_listener(self._handle_server_hello),
         ]
         self._audio_handler.attach_client(self._client)
+
+        if self._ui is not None:
+            self._ui.set_visualizer_enabled(self._visualizer_enabled)
 
         if self._visualizer_enabled:
             self._visualizer_handler = VisualizerHandler(
                 on_frame=self._handle_visualizer_frame,
             )
             self._visualizer_handler.attach_client(self._client)
+            self._beat_handler = BeatHandler(
+                on_beat=self._handle_beat,
+                on_schedule=self._handle_beat_schedule,
+            )
+            self._beat_handler.attach_client(self._client)
+            self._peak_handler = PeakHandler(
+                on_peak=self._handle_peak,
+                on_schedule=self._handle_peak_schedule,
+            )
+            self._peak_handler.attach_client(self._client)
+            self._listener_unsubscribes.append(
+                self._client.add_stream_start_listener(self._handle_stream_start)
+            )
+            if self._ui is not None:
+                self._ui.set_server_clock(self._server_now_us)
+
+        if self._supports_artwork:
+            self._artwork_handler = ArtworkHandler(
+                on_image=self._handle_artwork_update,
+            )
+            self._artwork_handler.attach_client(self._client)
 
         if MPRIS_AVAILABLE and self._args.use_mpris:
             self._mpris = SendspinMpris(self._client)
@@ -335,10 +411,29 @@ class SendspinApp:
             unsub()
         self._listener_unsubscribes = []
         self._audio_handler.detach_client()
+        # Drop the per-server palette so a non-color server reverts to unthemed.
+        if self._ui is not None:
+            self._ui.reset_palette()
 
         if self._visualizer_handler:
             self._visualizer_handler.detach()
             self._visualizer_handler = None
+        if self._beat_handler:
+            self._beat_handler.detach()
+            self._beat_handler = None
+        if self._peak_handler:
+            self._peak_handler.detach()
+            self._peak_handler = None
+        if self._ui is not None:
+            self._ui.set_server_clock(None)
+            self._ui.set_visualizer_types(frozenset())
+
+        if self._artwork_handler is not None:
+            self._artwork_handler.detach()
+            self._artwork_handler = None
+        if self._ui is not None:
+            self._ui.state.artwork_image = None
+            self._ui.state.artwork_generation += 1
 
         if self._mpris:
             self._mpris.stop()
@@ -370,6 +465,7 @@ class SendspinApp:
                 if args.static_delay_ms is not None
                 else self._settings.static_delay_ms
             )
+            self._applied_delay_ms = max(0.0, min(5000.0, delay))
 
             self._audio_handler = AudioStreamHandler(
                 audio_device=args.audio_device,
@@ -397,11 +493,13 @@ class SendspinApp:
             await self._audio_handler.start_volume_monitor()
 
             self._ui = SendspinUI(
-                delay,
+                self._applied_delay_ms,
                 player_volume=self._audio_handler.volume,
                 player_muted=self._audio_handler.muted,
                 use_external_volume=self._audio_handler.uses_external_volume_controller,
                 visualizer_enabled=self._visualizer_enabled,
+                color_mode=ColorMode.parse(self._settings.color_mode),
+                on_color_mode_change=self._persist_color_mode,
             )
             self._ui.start()
             self._ui.add_event(f"Using client ID: {args.client_id}")
@@ -423,6 +521,7 @@ class SendspinApp:
                     self._on_server_selected,
                     request_shutdown,
                     on_toggle_visualizer=self._toggle_visualizer,
+                    on_delay_changed=self._set_applied_delay,
                 )
             )
 
@@ -476,6 +575,10 @@ class SendspinApp:
                 self._mpris.stop()
             if self._visualizer_handler:
                 self._visualizer_handler.detach()
+            if self._beat_handler:
+                self._beat_handler.detach()
+            if self._peak_handler:
+                self._peak_handler.detach()
             if self._ui:
                 self._ui.stop()
             if self._audio_handler:
@@ -508,6 +611,7 @@ class SendspinApp:
         self._ui.set_disconnected(message)
         if self._visualizer_handler:
             self._visualizer_handler.reset()
+        self._clear_visualizer_timelines()
         await self._audio_handler.handle_disconnect()
 
     async def _connect_cancellable(self, url: str) -> None:
@@ -702,6 +806,25 @@ class SendspinApp:
             ui.set_repeat_shuffle(state.repeat_mode, state.shuffle)
         ui.add_event(state.describe())
 
+    def _clear_visualizer_timelines(self) -> None:
+        """Drop the beat and peak strips, cancelling their pending schedules."""
+        if self._beat_handler:
+            self._beat_handler.reset()
+        if self._peak_handler:
+            self._peak_handler.reset()
+        if self._ui is not None:
+            self._ui.clear_beats()
+            self._ui.clear_peaks()
+
+    def _handle_color_update(self, payload: ServerStatePayload) -> None:
+        """Forward a color@v1 palette payload to the UI."""
+        assert self._ui is not None
+        self._ui.update_palette(payload.color)
+
+    def _persist_color_mode(self, mode: ColorMode) -> None:
+        """Persist the user's color theme choice."""
+        self._settings.update(color_mode=mode.value)
+
     def _handle_group_update(self, payload: GroupUpdateServerPayload) -> None:
         """Handle group update messages."""
         assert self._ui is not None
@@ -719,9 +842,13 @@ class SendspinApp:
         with ui.batch_update():
             ui.set_group_name(payload.group_name)
             if payload.playback_state:
+                changed = payload.playback_state != state.playback_state
                 state.playback_state = payload.playback_state
                 ui.set_playback_state(payload.playback_state)
                 ui.add_event(f"Playback state: {payload.playback_state.value}")
+                # No stream/clear fires on pause, so drop the frozen strips here.
+                if changed and payload.playback_state != PlaybackStateType.PLAYING:
+                    self._clear_visualizer_timelines()
 
     def _handle_server_state(self, payload: ServerStatePayload) -> None:
         """Handle server/state messages with controller state."""
@@ -764,6 +891,22 @@ class SendspinApp:
             self._ui.add_event(
                 "Server muted player" if player_cmd.mute else "Server unmuted player"
             )
+        elif (
+            player_cmd.command == PlayerCommand.SET_STATIC_DELAY
+            and player_cmd.static_delay_ms is not None
+        ):
+            # Client library already applied the delay change;
+            # notify audio worker so sync correction adjusts timing gradually
+            assert self._client is not None
+            assert self._audio_handler is not None
+            new_delay_ms = self._client.static_delay_ms
+            delta_us = int((new_delay_ms - self._applied_delay_ms) * 1000)
+            if delta_us != 0:
+                self._audio_handler.notify_delay_change(delta_us)
+            self._applied_delay_ms = new_delay_ms
+            self._ui.set_delay(new_delay_ms)
+            self._settings.update(static_delay_ms=new_delay_ms)
+            self._ui.add_event(f"Server set delay: {player_cmd.static_delay_ms}ms")
 
     def _handle_format_change(
         self, codec: str | None, sample_rate: int, bit_depth: int, channels: int
@@ -771,6 +914,10 @@ class SendspinApp:
         """Handle audio format changes by updating the UI."""
         assert self._ui is not None
         self._ui.set_audio_format(codec, sample_rate, bit_depth, channels)
+
+    def _set_applied_delay(self, delay_ms: float) -> None:
+        """Mirror the locally-applied static delay so SET_STATIC_DELAY deltas stay correct."""
+        self._applied_delay_ms = delay_ms
 
     async def _toggle_visualizer(self) -> None:
         """Toggle the visualizer on/off, reconnecting with updated roles."""
@@ -795,10 +942,79 @@ class SendspinApp:
             if not self._cancel_connect():
                 await old_client.disconnect()
 
+    def _server_now_us(self) -> int:
+        """Current time in the server clock the beat and peak strips are drawn against.
+
+        Strip events carry server-clock timestamps, so the strip's "now" must be
+        in the same domain. This is the inverse of ``compute_play_time``, so an
+        event lands on the playhead cell exactly when it becomes audible.
+        """
+        assert self._client is not None
+        return self._client.compute_server_time(self._client.now_us())
+
+    def _handle_server_hello(self, payload: ServerHelloPayload) -> None:
+        """Hide the visualizer panel when the server didn't activate visualizer@v1."""
+        if not self._visualizer_enabled:
+            return
+        if Roles.VISUALIZER.value in payload.active_roles:
+            return
+        logger.warning(
+            "Server did not activate %s (active_roles=%s); hiding the visualizer panel.",
+            Roles.VISUALIZER.value,
+            payload.active_roles,
+        )
+        if self._ui is not None:
+            self._ui.set_visualizer_enabled(False)
+
+    def _handle_stream_start(self, message: StreamStartMessage) -> None:
+        """Record which visualizer types the server negotiated for this stream."""
+        if self._ui is None:
+            return
+        config = message.payload.visualizer
+        types = (
+            frozenset(config.types) if isinstance(config, StreamStartVisualizer) else frozenset()
+        )
+        self._ui.set_visualizer_types(types)
+
+    def _handle_artwork_update(self, image: PILImage | None) -> None:
+        """Receive a decoded artwork image (or None to clear) from the handler."""
+        if self._ui is None:
+            return
+        self._ui.state.artwork_image = image
+        self._ui.state.artwork_generation += 1
+        self._ui.refresh()
+
     def _handle_visualizer_frame(self, frame: VisualizerFrame) -> None:
         """Handle a visualizer frame from the connector."""
         if self._ui is not None:
-            self._ui.set_visualizer_frame(frame.spectrum, frame.loudness)
+            self._ui.set_visualizer_frame(
+                frame.spectrum,
+                frame.loudness,
+                frame.pitch_midi_q88,
+                frame.f_peak_freq,
+            )
+
+    def _handle_beat(self, beat: BeatTiming) -> None:
+        """Handle a beat hitting the playhead."""
+        if self._ui is not None:
+            self._ui.record_beat(beat)
+
+    def _handle_beat_schedule(self, scheduled: list[BeatTiming]) -> None:
+        """Handle an updated upcoming-beat schedule."""
+        if self._ui is not None:
+            self._ui.set_beat_schedule(scheduled)
+
+    def _handle_peak(self, timestamp_us: int, strength: int) -> None:
+        """Handle an energy-onset peak hitting the playhead."""
+        if self._ui is not None:
+            self._ui.record_peak(PeakEvent(timestamp_us=timestamp_us, strength=strength))
+
+    def _handle_peak_schedule(self, scheduled: list[tuple[int, int]]) -> None:
+        """Handle an updated upcoming-peak schedule."""
+        if self._ui is not None:
+            self._ui.set_peak_schedule(
+                [PeakEvent(timestamp_us=ts, strength=strength) for ts, strength in scheduled]
+            )
 
     def _on_stream_event(self, event: str) -> None:
         """Handle stream lifecycle events by running hooks."""
